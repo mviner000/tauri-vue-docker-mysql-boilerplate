@@ -1,9 +1,13 @@
+<!-- src/App.vue -->
+
 <script setup lang="ts">
-import { Button } from '@/components/ui/button'
+import { Toaster } from '@/components/ui/toast'
+import NotesTable from '@/components/notes/NotesTable.vue'
 </script>
 
 <template>
   <div>
-    <Button>Click me</Button>
+    <Toaster />
+    <NotesTable />
   </div>
 </template>
