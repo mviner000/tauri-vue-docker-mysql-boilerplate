@@ -115,6 +115,41 @@ pub fn is_linux() -> bool {
     detect_os() == OperatingSystem::Linux
 }
 
+#[tauri::command]
+async fn setup_ubuntu_system(app: tauri::AppHandle) -> Result<(), String> {
+    UbuntuSystemSetup::setup_ubuntu_system_with_events(&app)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn is_docker_installed() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::process::Command;
+        Command::new("which")
+            .arg("docker")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+#[tauri::command]
+fn get_os_type() -> String {
+    match detect_os() {
+        OperatingSystem::Windows => "Windows".to_string(),
+        OperatingSystem::MacOS => "MacOS".to_string(),
+        OperatingSystem::Linux => "Linux".to_string(),
+        OperatingSystem::Unknown => "Unknown".to_string(),
+    }
+}
+
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Enable logging
@@ -145,7 +180,7 @@ pub fn run() {
                         WindowsSystemSetup::setup_windows_system(&app_handle).await
                     },
                     OperatingSystem::Linux => {
-                        UbuntuSystemSetup::setup_ubuntu_system(&app_handle).await
+                        UbuntuSystemSetup::setup_ubuntu_system_with_events(&app_handle).await
                     },
                     OperatingSystem::MacOS => Ok(()),
                     OperatingSystem::Unknown => {
@@ -176,7 +211,10 @@ pub fn run() {
             get_all_notes,
             get_note_by_id,
             update_note,
-            delete_note
+            delete_note,
+            setup_ubuntu_system,
+            is_docker_installed,
+            get_os_type
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -6,39 +6,79 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use tauri_plugin_shell::ShellExt;
 use tauri::Manager;
-use tokio::process::Command;
+use tauri::Emitter;
+use serde::{Serialize, Deserialize};
 use tokio::fs;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum InstallationStage {
+    NotStarted,
+    CheckingDocker,
+    DockerNotInstalled,
+    DockerInstalling,
+    DockerInstallFailed,
+    DockerInstalled,
+    PreparingMySQLContainer,
+    StartingMySQLContainer,
+    MySQLContainerStarted,
+    MySQLSetupFailed,
+    SetupComplete
+}
 
 pub struct UbuntuSystemSetup;
 
 impl UbuntuSystemSetup {
-    pub async fn setup_ubuntu_system(app: &tauri::AppHandle) -> Result<()> {
+    pub async fn setup_ubuntu_system_with_events(app: &tauri::AppHandle) -> Result<()> {
+        // Emit initial stage
+        app.emit("installation-stage", InstallationStage::NotStarted)?;
+
         // Only proceed if the OS is Linux (specifically Ubuntu)
         if detect_os() != OperatingSystem::Linux {
-            println!("Skipping Ubuntu-specific setup: Not running on Linux");
+            app.emit("installation-stage", InstallationStage::SetupComplete)?;
             return Ok(());
         }
 
         println!("Starting Ubuntu-specific system setup...");
+        app.emit("installation-stage", InstallationStage::CheckingDocker)?;
 
         // Check Ubuntu version
         Self::check_ubuntu_version(app).await?;
 
-        // Open terminal with Docker installation script only if Docker is not installed
+        // Check and install Docker
         if !Self::check_docker(app).await {
-            Self::open_docker_installation_terminal(app).await?;
+            app.emit("installation-stage", InstallationStage::DockerNotInstalled)?;
+            
+            match Self::open_docker_installation_terminal(app).await {
+                Ok(_) => app.emit("installation-stage", InstallationStage::DockerInstalling)?,
+                Err(_) => app.emit("installation-stage", InstallationStage::DockerInstallFailed)?,
+            }
         } else {
+            app.emit("installation-stage", InstallationStage::DockerInstalled)?;
             println!("Docker is already installed. Skipping installation.");
         }
 
         // Prepare Docker Compose file for MySQL
+        app.emit("installation-stage", InstallationStage::PreparingMySQLContainer)?;
         Self::prepare_docker_compose(app).await?;
 
         // Check and start MySQL container
-        Self::manage_mysql_container(app).await?;
-
-        println!("✓ Ubuntu system setup completed");
-        Ok(())
+        app.emit("installation-stage", InstallationStage::StartingMySQLContainer)?;
+            match Self::manage_mysql_container(app).await {
+                Ok(_) => {
+                    app.emit("installation-stage", InstallationStage::MySQLContainerStarted)?;
+                    println!("✓ Ubuntu system setup completed");
+                    
+                    // Add a 30-second delay before emitting SetupComplete
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    
+                    app.emit("installation-stage", InstallationStage::SetupComplete)?;
+                    Ok(())
+                },
+                Err(_) => {
+                    app.emit("installation-stage", InstallationStage::MySQLSetupFailed)?;
+                    Err(anyhow!("MySQL container setup failed"))
+                }
+            }
     }
 
     pub async fn check_docker(app: &tauri::AppHandle) -> bool {
@@ -151,14 +191,21 @@ services:
     environment:
       MYSQL_ROOT_PASSWORD: password
       MYSQL_DATABASE: app_db
+      MYSQL_USER: appuser
+      MYSQL_PASSWORD: apppassword
     ports:
       - "3306:3306"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-ppassword"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
 volumes:
   mysql_data:
     name: mysql_data
-            "#;
+    "#;
 
         // Create docker-compose directory in app's local data directory
         let docker_compose_dir = app.path().local_data_dir()?.join("docker");
@@ -173,30 +220,58 @@ volumes:
     }
 
     async fn verify_database_creation(app: &tauri::AppHandle) -> Result<()> {
-        // Use MySQL client to check database existence
-        let output = app.shell().command("docker")
-            .args([
-                "exec", 
-                "mysql", 
-                "mysql", 
-                "-u", "root", 
-                "-ppassword", 
-                "-e", 
-                "SHOW DATABASES LIKE 'app_db'"
-            ])
+        // Additional connection test using netcat
+        let nc_output = app.shell().command("nc")
+            .args(["-zv", "localhost", "3306"])
             .output()
-            .await?;
-
-        let output_str = String::from_utf8_lossy(&output.stdout);
-        
-        if output_str.contains("app_db") {
-            Ok(())
-        } else {
-            Err(anyhow!("Database 'app_db' not found"))
+            .await;
+    
+        if nc_output.is_err() {
+            return Err(anyhow!("MySQL port not accessible"));
         }
+    
+        // Try multiple database connection methods
+        let connection_commands = vec![
+            // Direct MySQL command
+            vec![
+                "docker", "exec", "mysql", 
+                "mysql", "-u", "root", 
+                "-ppassword", 
+                "-e", "CREATE DATABASE IF NOT EXISTS app_db; SHOW DATABASES LIKE 'app_db'"
+            ],
+            // Alternative connection method
+            vec![
+                "docker", "exec", "mysql", 
+                "bash", "-c", 
+                "mysql -u root -ppassword -e 'CREATE DATABASE IF NOT EXISTS app_db; SHOW DATABASES LIKE \"app_db\"'"
+            ]
+        ];
+    
+        for cmd in connection_commands {
+            let output = app.shell().command(cmd[0])
+                .args(&cmd[1..])
+                .output()
+                .await
+                .map_err(|e| anyhow!("Failed to execute MySQL command: {}", e))?;
+    
+            let output_str = String::from_utf8_lossy(&output.stdout);
+            let error_str = String::from_utf8_lossy(&output.stderr);
+            
+            println!("Database check output: {}", output_str);
+            println!("Database check error: {}", error_str);
+            
+            if output_str.contains("app_db") {
+                return Ok(());
+            }
+        }
+    
+        Err(anyhow!("Database 'app_db' creation failed after multiple attempts"))
     }
 
     async fn manage_mysql_container(app: &tauri::AppHandle) -> Result<()> {
+        // Add more verbose logging
+        println!("Attempting to manage MySQL container...");
+    
         // Check if MySQL container is already running
         let container_list = app.shell().command("docker")
             .args(["ps", "-f", "name=mysql", "--format", "{{.Status}}"])
@@ -206,51 +281,61 @@ volumes:
         let container_status = String::from_utf8_lossy(&container_list.stdout);
     
         if container_status.trim().is_empty() || container_status.contains("Exited") {
-            println!("Starting MySQL container...");
+            println!("MySQL container not running. Attempting to start...");
             
             let docker_compose_dir = app.path().local_data_dir()?.join("docker");
             let compose_path = docker_compose_dir.join("docker-compose.yml");
     
-            // Create a shell script for verbose Docker Compose
-            let verbose_script = format!(r#"#!/bin/bash
-    cd {}
-    echo "Running Docker Compose up with verbose logging..."
-    docker compose -f {} up -d
-    echo "Press Enter to close this terminal..."
-    read
-    "#, 
-                docker_compose_dir.to_string_lossy(), 
-                compose_path.to_string_lossy()
-            );
-    
-            // Write the verbose script
-            let script_path = std::env::temp_dir().join("docker_compose_up.sh");
-            tokio::fs::write(&script_path, verbose_script).await?;
-    
-            // Make script executable
-            app.shell().command("chmod")
-                .args(["+x", &script_path.to_string_lossy()])
+            // Run Docker Compose with output capture for better error logging
+            let compose_output = app.shell().command("docker")
+                .args(["compose", "-f", compose_path.to_string_lossy().as_ref(), "up", "-d"])
                 .output()
                 .await?;
     
-            // Open terminal with the script
-            app.shell().command("x-terminal-emulator")
-                .args(["-e", &script_path.to_string_lossy()])
+            // Log stdout and stderr
+            println!("Docker Compose Stdout: {}", String::from_utf8_lossy(&compose_output.stdout));
+            println!("Docker Compose Stderr: {}", String::from_utf8_lossy(&compose_output.stderr));
+    
+            // Wait for container to be fully healthy
+            for attempt in 0..30 {  // 30 attempts with 2-second intervals
+                let health_output = app.shell().command("docker")
+                    .args(["inspect", "--format={{.State.Health.Status}}", "mysql"])
+                    .output()
+                    .await?;
+                
+                let health_status = String::from_utf8_lossy(&health_output.stdout).trim().to_string();
+                println!("Container health status (Attempt {}): {}", attempt + 1, health_status);
+    
+                if health_status == "healthy" {
+                    break;
+                }
+    
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+    
+            // Additional container check
+            let check_output = app.shell().command("docker")
+                .args(["ps", "-f", "name=mysql"])
                 .output()
                 .await?;
+            
+            println!("Container Check Output: {}", String::from_utf8_lossy(&check_output.stdout));
     
-            // Wait for potential container startup
-            thread::sleep(Duration::from_secs(20));
-    
-            // Verify database creation
-            Self::verify_database_creation(app).await?;
-    
-            println!("✓ MySQL container started successfully");
+            // Verify database creation with more detailed error handling
+            match Self::verify_database_creation(app).await {
+                Ok(_) => {
+                    println!("✓ MySQL container started and database verified");
+                    Ok(())
+                },
+                Err(e) => {
+                    println!("Database verification failed: {}", e);
+                    Err(anyhow!("Failed to verify MySQL database: {}", e))
+                }
+            }
         } else {
             println!("MySQL container is already running");
+            Ok(())
         }
-    
-        Ok(())
     }
 
     pub async fn check_ubuntu_version(app: &tauri::AppHandle) -> Result<()> {
