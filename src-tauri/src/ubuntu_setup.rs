@@ -269,34 +269,42 @@ volumes:
     }
 
     async fn manage_mysql_container(app: &tauri::AppHandle) -> Result<()> {
-        // Add more verbose logging
-        println!("Attempting to manage MySQL container...");
-    
+        // Emit log function to send logs to frontend
+        let emit_log = |message: &str| {
+            let _ = app.emit("mysql-container-log", message);
+            println!("{}", message);  // Also print to console
+        };
+
+        emit_log("Attempting to manage MySQL container...");
+
         // Check if MySQL container is already running
         let container_list = app.shell().command("docker")
             .args(["ps", "-f", "name=mysql", "--format", "{{.Status}}"])
             .output()
             .await?;
-    
+
         let container_status = String::from_utf8_lossy(&container_list.stdout);
-    
+        emit_log(&format!("Container status: {}", container_status.trim()));
+
         if container_status.trim().is_empty() || container_status.contains("Exited") {
-            println!("MySQL container not running. Attempting to start...");
+            emit_log("MySQL container not running. Attempting to start...");
             
             let docker_compose_dir = app.path().local_data_dir()?.join("docker");
             let compose_path = docker_compose_dir.join("docker-compose.yml");
-    
+
             // Run Docker Compose with output capture for better error logging
             let compose_output = app.shell().command("docker")
                 .args(["compose", "-f", compose_path.to_string_lossy().as_ref(), "up", "-d"])
                 .output()
                 .await?;
-    
-            // Log stdout and stderr
-            println!("Docker Compose Stdout: {}", String::from_utf8_lossy(&compose_output.stdout));
-            println!("Docker Compose Stderr: {}", String::from_utf8_lossy(&compose_output.stderr));
-    
-            // Wait for container to be fully healthy
+
+            // Emit Docker Compose logs
+            emit_log(&format!("Docker Compose Stdout: {}", 
+                String::from_utf8_lossy(&compose_output.stdout)));
+            emit_log(&format!("Docker Compose Stderr: {}", 
+                String::from_utf8_lossy(&compose_output.stderr)));
+
+            // Wait for container to be fully healthy with logging
             for attempt in 0..30 {  // 30 attempts with 2-second intervals
                 let health_output = app.shell().command("docker")
                     .args(["inspect", "--format={{.State.Health.Status}}", "mysql"])
@@ -304,36 +312,38 @@ volumes:
                     .await?;
                 
                 let health_status = String::from_utf8_lossy(&health_output.stdout).trim().to_string();
-                println!("Container health status (Attempt {}): {}", attempt + 1, health_status);
-    
+                emit_log(&format!("Container health status (Attempt {}): {}", 
+                    attempt + 1, health_status));
+
                 if health_status == "healthy" {
                     break;
                 }
-    
+
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
-    
+
             // Additional container check
             let check_output = app.shell().command("docker")
                 .args(["ps", "-f", "name=mysql"])
                 .output()
                 .await?;
             
-            println!("Container Check Output: {}", String::from_utf8_lossy(&check_output.stdout));
-    
+            emit_log(&format!("Container Check Output: {}", 
+                String::from_utf8_lossy(&check_output.stdout)));
+
             // Verify database creation with more detailed error handling
             match Self::verify_database_creation(app).await {
                 Ok(_) => {
-                    println!("✓ MySQL container started and database verified");
+                    emit_log("✓ MySQL container started and database verified");
                     Ok(())
                 },
                 Err(e) => {
-                    println!("Database verification failed: {}", e);
+                    emit_log(&format!("Database verification failed: {}", e));
                     Err(anyhow!("Failed to verify MySQL database: {}", e))
                 }
             }
         } else {
-            println!("MySQL container is already running");
+            emit_log("MySQL container is already running");
             Ok(())
         }
     }
