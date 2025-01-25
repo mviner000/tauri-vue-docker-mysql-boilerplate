@@ -77,10 +77,10 @@ onUnmounted(() => {
     </div>
     
     <!-- Optional: Detailed logs display -->
-    <div v-if="setupLogs.length > 0" class="text-xs text-gray-600">
+    <!-- <div v-if="setupLogs.length > 0" class="text-xs text-gray-600">
       <div v-for="(log, index) in setupLogs" :key="index">
         {{ log }}
       </div>
-    </div>
+    </div> -->
   </nav>
 </template>

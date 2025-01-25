@@ -6,15 +6,16 @@ mod db;
 mod models;
 
 use std::env;
-use log::{info, debug};
+use log::{info, debug, error};
 use anyhow::Result;
 use tauri::{State, Manager};
 use mysql_async::Pool;
 
-use crate::windows_setup::WindowsSystemSetup;
+use crate::ubuntu_setup::InstallationStage;
 use crate::ubuntu_setup::UbuntuSystemSetup;
 use crate::db::notes::NoteRepository;
 use crate::models::Note;
+use tauri::Emitter;
 
 #[tauri::command]
 async fn create_note(
@@ -67,6 +68,17 @@ async fn delete_note(
 ) -> Result<bool, String> {
     let repo = NoteRepository::new(pool.inner().clone());
     repo.delete_note(id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn start_ubuntu_setup(app: tauri::AppHandle) -> Result<(), String> {
+    // Add initial stage reset
+    app.emit("installation-stage", InstallationStage::NotStarted)
+        .map_err(|e| e.to_string())?;
+        
+    UbuntuSystemSetup::setup_ubuntu_system_with_events(&app)
         .await
         .map_err(|e| e.to_string())
 }
@@ -149,6 +161,25 @@ fn get_os_type() -> String {
     }
 }
 
+#[tauri::command]
+async fn respond_to_sudo_password_request(
+    app: tauri::AppHandle,
+    request_id: String, 
+    password: String
+) -> Result<(), String> {
+    // Validate inputs
+    if request_id.is_empty() {
+        return Err("Request ID cannot be empty".to_string());
+    }
+
+    // Use the request_id to create a unique event name
+    let event_name = format!("sudo-password-response-{}", request_id);
+    
+    // Emit the password directly as a string
+    app.emit(&event_name, password)
+        .map_err(|e| e.to_string())
+}
+
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -172,38 +203,6 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
-            let app_handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                // OS setup
-                let os_result = match detect_os() {
-                    OperatingSystem::Windows => {
-                        WindowsSystemSetup::setup_windows_system(&app_handle).await
-                    },
-                    OperatingSystem::Linux => {
-                        UbuntuSystemSetup::setup_ubuntu_system_with_events(&app_handle).await
-                    },
-                    OperatingSystem::MacOS => Ok(()),
-                    OperatingSystem::Unknown => {
-                        Err(anyhow::anyhow!("Unsupported operating system"))
-                    }
-                };
-
-                // Database pool setup
-                if let Ok(_) = os_result {
-                    match db::create_database_pool().await {
-                        Ok(pool) => {
-                            app_handle.manage(pool);
-                            println!("Database pool created successfully");
-                        },
-                        Err(e) => eprintln!("Database pool creation failed: {}", e),
-                    }
-                } else {
-                    if let Err(e) = os_result {
-                        eprintln!("OS setup failed: {}", e);
-                    }
-                }
-            });
-
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -214,7 +213,9 @@ pub fn run() {
             delete_note,
             setup_ubuntu_system,
             is_docker_installed,
-            get_os_type
+            get_os_type,
+            start_ubuntu_setup,
+            respond_to_sudo_password_request
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
