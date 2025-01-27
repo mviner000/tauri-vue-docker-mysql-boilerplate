@@ -1,6 +1,4 @@
 <!-- src/App.vue -->
-
-
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
@@ -9,11 +7,21 @@ import { Toaster } from '@/components/ui/toast'
 import NotesTable from '@/components/notes/NotesTable.vue'
 import SystemInfoNavbar from '@/components/SystemInfoNavbar.vue'
 import UbuntuSetupModal from './components/UbuntuSetupModal.vue'
+import WindowsSetupModal from './components/WindowsSetupModal.vue'
 
-const isUbuntuSetupRequired = ref(false)
-const currentSudoPasswordRequestId = ref('')
+interface SetupState {
+  isSetupRequired: boolean
+  currentSudoPasswordRequestId: string
+  osType: string | null
+}
 
-// Handle sudo password requests from backend
+const setupState = ref<SetupState>({
+  isSetupRequired: false,
+  currentSudoPasswordRequestId: '',
+  osType: null
+})
+
+// Handle sudo password requests from backend (Ubuntu-specific)
 const handleSudoPasswordRequest = async (event: Event<{ request_id: string }>) => {
   try {
     console.log('DEBUG: Received password request event:', event)
@@ -23,10 +31,8 @@ const handleSudoPasswordRequest = async (event: Event<{ request_id: string }>) =
       return
     }
 
-    // Update the request ID and show modal
-    currentSudoPasswordRequestId.value = event.payload.request_id
-    isUbuntuSetupRequired.value = true
-    
+    setupState.value.currentSudoPasswordRequestId = event.payload.request_id
+    setupState.value.isSetupRequired = true
   } catch (error) {
     console.error('Error handling password request:', error)
   }
@@ -38,25 +44,48 @@ const handleInstallationStage = async (event: Event<string>) => {
   if (stage === 'SetupComplete') {
     // Close modal after short delay
     setTimeout(() => {
-      isUbuntuSetupRequired.value = false
+      setupState.value.isSetupRequired = false
     }, 5000)
   }
 }
 
-onMounted(async () => {
+// Handle modal state changes
+const handleModalOpenChange = (open: boolean) => {
+  setupState.value.isSetupRequired = open
+}
+
+// Initialize system based on OS type
+const initializeSystem = async () => {
   try {
-    // Set up event listeners
-    await listen('sudo-password-request', handleSudoPasswordRequest)
+    const osType = await invoke('get_os_type') as string
+    setupState.value.osType = osType
+
+    // Set up event listeners for both OS types
     await listen('installation-stage', handleInstallationStage)
 
-    // Check OS type on mount
-    const osType = await invoke('get_os_type') as string
-    if (osType === 'Linux') {
-      isUbuntuSetupRequired.value = true
+    switch (osType) {
+      case 'Linux':
+        await listen('sudo-password-request', handleSudoPasswordRequest)
+        setupState.value.isSetupRequired = true
+        break
+        
+      case 'Windows':
+        const isDockerInstalled = await invoke('is_docker_installed') as boolean
+        if (!isDockerInstalled) {
+          setupState.value.isSetupRequired = true
+        }
+        break
+        
+      default:
+        console.log('Unsupported OS:', osType)
     }
   } catch (error) {
-    console.error('Initialization error:', error)
+    console.error('System initialization error:', error)
   }
+}
+
+onMounted(async () => {
+  await initializeSystem()
 })
 </script>
 
@@ -65,11 +94,21 @@ onMounted(async () => {
     <SystemInfoNavbar />
     <Toaster />
     
-    <UbuntuSetupModal
-      v-model="isUbuntuSetupRequired" 
-      :current-sudo-password-request-id="currentSudoPasswordRequestId"
-    />
+    <!-- Dynamic Modal Selection Based on OS -->
+    <template v-if="setupState.isSetupRequired">
+      <WindowsSetupModal
+        v-if="setupState.osType === 'Windows'"
+        :open="setupState.isSetupRequired"
+        :onOpenChange="handleModalOpenChange"
+      />
+      
+      <UbuntuSetupModal
+        v-if="setupState.osType === 'Linux'"
+        v-model="setupState.isSetupRequired"
+        :current-sudo-password-request-id="setupState.currentSudoPasswordRequestId"
+      />
+    </template>
     
-    <NotesTable v-if="!isUbuntuSetupRequired" />
+    <NotesTable v-if="!setupState.isSetupRequired" />
   </div>
 </template>

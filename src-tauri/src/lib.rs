@@ -1,6 +1,8 @@
 // src/lib.rs
 
+#[cfg(target_os = "windows")]
 mod windows_setup;
+#[cfg(target_os = "linux")]
 mod ubuntu_setup;
 mod db;
 mod models;
@@ -9,13 +11,13 @@ use std::env;
 use log::{info, debug, error};
 use anyhow::Result;
 use tauri::{State, Manager};
+use tauri::Emitter;
 use mysql_async::Pool;
 
-use crate::ubuntu_setup::InstallationStage;
-use crate::ubuntu_setup::UbuntuSystemSetup;
+#[cfg(target_os = "linux")]
+use crate::ubuntu_setup::{InstallationStage, UbuntuSystemSetup};
 use crate::db::notes::NoteRepository;
 use crate::models::Note;
-use tauri::Emitter;
 
 #[tauri::command]
 async fn create_note(
@@ -72,9 +74,9 @@ async fn delete_note(
         .map_err(|e| e.to_string())
 }
 
+#[cfg(target_os = "linux")]
 #[tauri::command]
-async fn start_ubuntu_setup(app: tauri::AppHandle) -> Result<(), String> {
-    // Add initial stage reset
+async fn start_system_setup(app: tauri::AppHandle) -> Result<(), String> {
     app.emit("installation-stage", InstallationStage::NotStarted)
         .map_err(|e| e.to_string())?;
         
@@ -83,7 +85,17 @@ async fn start_ubuntu_setup(app: tauri::AppHandle) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Represents different operating systems
+#[cfg(target_os = "windows")]
+#[tauri::command]
+async fn start_system_setup(app: tauri::AppHandle) -> Result<(), String> {
+    app.emit("installation-stage", "NotStarted")
+        .map_err(|e| e.to_string())?;
+
+    windows_setup::WindowsSystemSetup::setup_windows_system(&app)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[derive(Debug, PartialEq)]
 pub enum OperatingSystem {
     Windows,
@@ -92,7 +104,6 @@ pub enum OperatingSystem {
     Unknown,
 }
 
-/// Detects the current operating system
 pub fn detect_os() -> OperatingSystem {
     match env::consts::OS {
         "windows" => OperatingSystem::Windows,
@@ -102,8 +113,8 @@ pub fn detect_os() -> OperatingSystem {
     }
 }
 
-/// Additional OS detection utilities
-pub fn get_os_details() -> String {
+#[tauri::command]
+fn get_os_details() -> String {
     format!(
         "OS: {}, Family: {}, Architecture: {}",
         env::consts::OS,
@@ -112,42 +123,34 @@ pub fn get_os_details() -> String {
     )
 }
 
-/// Check if the current OS is Windows
-pub fn is_windows() -> bool {
+#[tauri::command]
+fn is_windows() -> bool {
     detect_os() == OperatingSystem::Windows
 }
 
-/// Check if the current OS is MacOS
-pub fn is_macos() -> bool {
-    detect_os() == OperatingSystem::MacOS
-}
-
-/// Check if the current OS is Linux
-pub fn is_linux() -> bool {
-    detect_os() == OperatingSystem::Linux
-}
-
 #[tauri::command]
-async fn setup_ubuntu_system(app: tauri::AppHandle) -> Result<(), String> {
-    UbuntuSystemSetup::setup_ubuntu_system_with_events(&app)
-        .await
-        .map_err(|e| e.to_string())
+fn is_linux() -> bool {
+    detect_os() == OperatingSystem::Linux
 }
 
 #[tauri::command]
 fn is_docker_installed() -> bool {
     #[cfg(target_os = "linux")]
     {
-        use std::process::Command;
-        Command::new("which")
+        std::process::Command::new("which")
             .arg("docker")
             .output()
             .map(|output| output.status.success())
             .unwrap_or(false)
     }
-    #[cfg(not(target_os = "linux"))]
+    
+    #[cfg(target_os = "windows")]
     {
-        false
+        std::process::Command::new("where")
+            .arg("docker")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
     }
 }
 
@@ -161,29 +164,8 @@ fn get_os_type() -> String {
     }
 }
 
-#[tauri::command]
-async fn respond_to_sudo_password_request(
-    app: tauri::AppHandle,
-    request_id: String, 
-    password: String
-) -> Result<(), String> {
-    // Validate inputs
-    if request_id.is_empty() {
-        return Err("Request ID cannot be empty".to_string());
-    }
-
-    // Use the request_id to create a unique event name
-    let event_name = format!("sudo-password-response-{}", request_id);
-    
-    // Emit the password directly as a string
-    app.emit(&event_name, password)
-        .map_err(|e| e.to_string())
-}
-
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Enable logging
     env_logger::init();
 
     let current_os = detect_os();
@@ -192,12 +174,11 @@ pub fn run() {
     debug!("Detected OS: {:?}", current_os);
     debug!("Full OS Details: {}", get_os_details());
 
-    // Example of OS-specific logic
     match current_os {
         OperatingSystem::Windows => debug!("Running on Windows"),
         OperatingSystem::MacOS => debug!("Running on macOS"),
         OperatingSystem::Linux => debug!("Running on Linux"),
-        OperatingSystem::Unknown => debug!("Running on an unknown OS"),
+        OperatingSystem::Unknown => debug!("Running on unknown OS"),
     }
 
     tauri::Builder::default()
@@ -211,11 +192,11 @@ pub fn run() {
             get_note_by_id,
             update_note,
             delete_note,
-            setup_ubuntu_system,
+            start_system_setup,
             is_docker_installed,
             get_os_type,
-            start_ubuntu_setup,
-            respond_to_sudo_password_request
+            get_os_details,
+            is_windows 
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

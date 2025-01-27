@@ -1,10 +1,9 @@
 // src/ubuntu_setup.rs
 
+#![cfg(target_os = "linux")]
+
 use crate::{detect_os, OperatingSystem};
-use rand::distributions::Alphanumeric;
-use rand::{thread_rng, Rng};
 use std::time::Duration;
-use std::fs::Permissions;
 use std::os::unix::fs::PermissionsExt;
 use tauri_plugin_shell::process::CommandEvent;
 use std::sync::Arc;

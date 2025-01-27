@@ -5,121 +5,94 @@ use std::thread;
 use std::time::Duration;
 use anyhow::{Result, anyhow};
 use tauri_plugin_shell::ShellExt;
-use tauri::Manager;
+use tauri::Emitter;
 use tokio::process::Command;
 
 pub struct WindowsSystemSetup;
 
 impl WindowsSystemSetup {
     pub async fn setup_windows_system(app: &tauri::AppHandle) -> Result<()> {
-        // Only proceed if the OS is Windows
+        app.emit("installation-stage", "CheckingDocker")
+            .map_err(|e| anyhow!("Event emission failed: {}", e))?;
+
         if detect_os() != OperatingSystem::Windows {
-            println!("Skipping Windows-specific setup: Not running on Windows");
             return Ok(());
         }
 
-        println!("Starting Windows-specific system setup...");
-
-        // Check Windows version compatibility
-        if let Ok(is_compatible) = Self::check_windows_version(app).await {
-            if !is_compatible {
-                return Err(anyhow!("Docker Desktop requires Windows 10/11 Pro, Enterprise, or Education"));
-            }
+        // Check Windows version
+        if let Ok(false) = Self::check_windows_version(app).await {
+            app.emit("installation-stage", "DockerInstallFailed")
+                .map_err(|e| anyhow!("Event emission failed: {}", e))?;
+            return Err(anyhow!("Incompatible Windows version"));
         }
 
-        // Check and install Docker if needed
+        // Docker check/install
         if !Self::check_docker(app).await {
-            println!("Docker not found. Installing Docker Desktop...");
+            app.emit("installation-stage", "DockerNotInstalled")?;
+            app.emit("installation-stage", "DockerInstalling")?;
+            
             Self::install_docker(app).await?;
+            app.emit("installation-stage", "DockerInstalled")?;
         } else {
-            println!("✓ Docker Desktop is already installed");
+            app.emit("installation-stage", "DockerInstalled")?;
         }
 
-        // Verify Docker is running
-        if let Ok(running) = Self::is_docker_running(app).await {
-            if !running {
-                return Err(anyhow!("Docker is installed but not running. Please start Docker Desktop."));
+        // Verify Docker running
+        if !Self::is_docker_running(app).await? {
+            return Err(anyhow!("Docker not running"));
+        }
+
+        // MySQL container setup
+        app.emit("installation-stage", "StartingMySQLContainer")?;
+        match Self::check_and_create_mysql_volume(app).await {
+            Ok(_) => app.emit("installation-stage", "MySQLContainerStarted")?,
+            Err(e) => {
+                app.emit("installation-stage", "MySQLSetupFailed")?;
+                return Err(e);
             }
-            println!("✓ Docker service is running");
-
-            // Setup MySQL container
-            Self::start_mysql_container(app).await?;
         }
 
-        // Add database volume creation to setup
-        Self::check_and_create_mysql_volume(app).await?;
-
-        println!("✓ Windows system setup completed successfully");
+        app.emit("installation-stage", "SetupComplete")?;
         Ok(())
     }
 
-    pub async fn check_and_create_mysql_volume(app: &tauri::AppHandle) -> Result<()> {
-        // Check if the volume exists
+
+    async fn check_and_create_mysql_volume(app: &tauri::AppHandle) -> Result<()> {
         let volume_check = app.shell().command("docker")
             .args(["volume", "ls", "--filter", "name=mysql_data"])
             .output()
             .await?;
-        
-        let volume_exists = String::from_utf8_lossy(&volume_check.stdout)
-            .contains("mysql_data");
-        
-        if !volume_exists {
-            println!("Creating MySQL data volume...");
-            let create_volume = app.shell().command("docker")
+
+        if !String::from_utf8_lossy(&volume_check.stdout).contains("mysql_data") {
+            let _ = app.shell().command("docker")
                 .args(["volume", "create", "mysql_data"])
                 .output()
                 .await?;
-            
-            if !create_volume.status.success() {
-                return Err(anyhow!("Failed to create MySQL data volume"));
-            }
-            println!("✓ MySQL data volume created successfully");
         }
 
-        // Recreate MySQL container with volume
-        println!("Stopping existing MySQL container...");
-        let _ = app.shell().command("docker")
-            .args(["stop", "mysql"])
-            .output()
-            .await;
-        
-        let _ = app.shell().command("docker")
-            .args(["rm", "mysql"])
-            .output()
-            .await;
-        
-        println!("Creating MySQL container with persistent volume...");
+        // Container creation with error handling
         let output = app.shell().command("docker")
             .args([
-                "run",
-                "-d",
-                "--name", "mysql",
+                "run", "-d", "--name", "mysql",
                 "-v", "mysql_data:/var/lib/mysql",
                 "-e", "MYSQL_ROOT_PASSWORD=password",
                 "-e", "MYSQL_DATABASE=app_db",
-                "-p", "3306:3306",
-                "mysql:8.0"
+                "-p", "3306:3306", "mysql:8.0"
             ])
             .output()
-            .await?;
+            .await
+            .map_err(|e| {
+                let _ = app.emit("installation-stage", "MySQLSetupFailed");
+                anyhow!(e)
+            })?;
 
         if !output.status.success() {
-            return Err(anyhow!("Failed to create MySQL container with volume"));
+            let _ = app.emit("installation-stage", "MySQLSetupFailed");
+            return Err(anyhow!("Container creation failed"));
         }
-        println!("✓ MySQL container with persistent volume created successfully");
 
-        // Wait for MySQL to initialize
-        println!("Waiting for MySQL to initialize...");
-        thread::sleep(Duration::from_secs(20)); // Increased wait time
-        
-        // Verify database creation
-        match Self::verify_database_creation(app).await {
-            Ok(_) => {
-                println!("✓ Database 'app_db' verified successfully");
-                Ok(())
-            },
-            Err(e) => Err(anyhow!("Database verification failed: {}", e))
-        }
+        thread::sleep(Duration::from_secs(20));
+        Ok(())
     }
 
     async fn verify_database_creation(app: &tauri::AppHandle) -> Result<()> {
@@ -146,7 +119,7 @@ impl WindowsSystemSetup {
         }
     }
 
-    pub async fn check_docker(app: &tauri::AppHandle) -> bool {
+    async fn check_docker(app: &tauri::AppHandle) -> bool {
         app.shell().command("docker")
             .args(["--version"])
             .output()
@@ -171,13 +144,9 @@ impl WindowsSystemSetup {
         Ok(installer_path.to_string_lossy().into_owned())
     }
 
-    pub async fn install_docker(app: &tauri::AppHandle) -> Result<()> {
+    async fn install_docker(app: &tauri::AppHandle) -> Result<()> {
         let installer_path = Self::download_docker_installer().await?;
-        
-        println!("Creating installation script...");
-        
-        // Create a more robust PowerShell installation script
-        // Note: We use a literal $env:ProgramFiles without trying to format it
+        let script_path = std::env::temp_dir().join("docker_install.ps1");
         let install_script = format!(
             r#"
             $ErrorActionPreference = 'Stop'
@@ -244,44 +213,32 @@ impl WindowsSystemSetup {
             "#,
             installer_path
         );
-    
-        let script_path = std::env::temp_dir().join("docker_install.ps1");
         tokio::fs::write(&script_path, install_script).await?;
-    
-        println!("Executing installation script...");
-        
+
         let output = app.shell().command("powershell")
-            .args([
-                "-ExecutionPolicy",
-                "Bypass",
-                "-NoProfile",
-                "-File",
-                &script_path.to_string_lossy(),
-            ])
+            .args(["-ExecutionPolicy", "Bypass", "-File", &script_path.to_string_lossy()])
             .output()
-            .await?;
-    
-        // Cleanup script
+            .await
+            .map_err(|e| {
+                let _ = app.emit("installation-stage", "DockerInstallFailed");
+                anyhow!(e)
+            })?;
+
         let _ = tokio::fs::remove_file(script_path).await;
-    
+
         if !output.status.success() {
-            let error = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!("Installation failed: {}", error));
+            let _ = app.emit("installation-stage", "DockerInstallFailed");
+            return Err(anyhow!("Install script failed"));
         }
-    
-        // Verify Docker is running
-        for i in 0..6 {
+
+        for _ in 0..6 {
             if Self::check_docker(app).await {
-                println!("Docker is now available!");
                 return Ok(());
             }
-            if i < 5 {
-                println!("Waiting for Docker to become available... ({}/5)", i + 1);
-                thread::sleep(Duration::from_secs(10));
-            }
+            thread::sleep(Duration::from_secs(10));
         }
-    
-        Err(anyhow!("Docker installation completed but Docker is not responding. Please start Docker Desktop manually."))
+
+        Err(anyhow!("Docker startup timeout"))
     }
 
     pub async fn check_mysql_container(app: &tauri::AppHandle) -> bool {
@@ -302,22 +259,29 @@ impl WindowsSystemSetup {
     pub async fn start_mysql_container(app: &tauri::AppHandle) -> Result<()> {
         let output = app.shell().command("docker")
             .args([
-                "run",
-                "-d",
+                "run", "-d",
                 "--name", "mysql",
-                "-p", "0.0.0.0:3306:3306",  // Bind to all network interfaces
+                "-v", "mysql_data:/var/lib/mysql",
                 "-e", "MYSQL_ROOT_PASSWORD=password",
                 "-e", "MYSQL_DATABASE=app_db",
+                "-p", "3306:3306",
                 "mysql:8.0"
             ])
             .output()
-            .await?;
+            .await
+            .map_err(|e| {
+                let _ = app.emit("installation-stage", "MySQLSetupFailed");
+                anyhow!(e)
+            })?;
     
         if !output.status.success() {
-            return Err(anyhow!("Failed to create MySQL container"));
+            let _ = app.emit("installation-stage", "MySQLSetupFailed");
+            return Err(anyhow!("MySQL container failed"));
         }
     
-        thread::sleep(Duration::from_secs(20));  // Increased wait time
+        // Wait for MySQL to be ready
+        thread::sleep(Duration::from_secs(20));
+    
         Ok(())
     }
     
@@ -360,29 +324,20 @@ impl WindowsSystemSetup {
     
     
     async fn is_docker_running(app: &tauri::AppHandle) -> Result<bool> {
-        // Instead of strictly checking service status, try a docker command
         let output = app.shell().command("docker")
             .args(["ps"])
             .output()
             .await?;
-    
         Ok(output.status.success())
     }
 
-    pub async fn check_windows_version(app: &tauri::AppHandle) -> Result<bool> {
+    async fn check_windows_version(app: &tauri::AppHandle) -> Result<bool> {
         let output = app.shell().command("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                "Get-CimInstance -ClassName Win32_OperatingSystem | Select-Object Caption,OperatingSystemSKU"
-            ])
+            .args(["-Command", "Get-CimInstance Win32_OperatingSystem | Select Caption"])
             .output()
             .await?;
 
-        let output_str = String::from_utf8_lossy(&output.stdout).to_lowercase();
-        
-        Ok(output_str.contains("pro") || 
-           output_str.contains("enterprise") || 
-           output_str.contains("education"))
+        let caption = String::from_utf8_lossy(&output.stdout).to_lowercase();
+        Ok(caption.contains("pro") || caption.contains("enterprise") || caption.contains("education"))
     }
 }
